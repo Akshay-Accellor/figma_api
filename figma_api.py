@@ -1,10 +1,12 @@
 import os
-import json
 import re
 import logging
 import requests
 from flask import Flask, request, jsonify, abort
-from flask import send_file
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,15 +14,11 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuration
-BASE_URL = os.getenv("FIGMA_BASE_URL", "https://api.figma.com/v1")
+# Figma Configuration
+BASE_URL = "https://api.figma.com/v1"
 FIGMA_API_TOKEN = os.getenv("FIGMA_API_TOKEN")
-UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "/app/uploads")
 
-# Ensure upload folder exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Figma processing functions
+# Function to extract file key from Figma URL
 def extract_file_key(figma_url):
     pattern = r"figma\.com/(?:file|design)/([a-zA-Z0-9_-]+)"
     match = re.search(pattern, figma_url)
@@ -36,6 +34,7 @@ def extract_file_key(figma_url):
         else:
             raise ValueError("Invalid Figma URL")
 
+# Function to fetch Figma file data to get frame nodes
 def fetch_figma_file(file_key):
     headers = {"X-Figma-Token": FIGMA_API_TOKEN}
     try:
@@ -51,6 +50,7 @@ def fetch_figma_file(file_key):
         logger.error(f"Network error: {str(e)}")
         raise Exception(f"Network error: {str(e)}")
 
+# Function to fetch images for frame nodes
 def fetch_figma_frame_images(file_key, frame_ids, scale=1, format="png"):
     headers = {"X-Figma-Token": FIGMA_API_TOKEN}
     max_ids_per_request = 100
@@ -79,6 +79,7 @@ def fetch_figma_frame_images(file_key, frame_ids, scale=1, format="png"):
     
     return image_urls
 
+# Function to extract frame nodes (screens)
 def extract_frames(file_data):
     frames = []
     frame_ids = []
@@ -100,38 +101,6 @@ def extract_frames(file_data):
     
     return frames, frame_ids
 
-def download_images(frames, session_id):
-    image_paths = {}
-    frame_folder = os.path.join(UPLOAD_FOLDER, "frames")
-    os.makedirs(frame_folder, exist_ok=True)
-    
-    session_folder = os.path.join(frame_folder, session_id)
-    os.makedirs(session_folder, exist_ok=True)
-    
-    for frame in frames:
-        if "image_url" not in frame:
-            continue
-        
-        try:
-            response = requests.get(frame["image_url"])
-            if response.status_code != 200:
-                logger.warning(f"Failed to download image for frame '{frame['name']}': HTTP {response.status_code}")
-                continue
-            
-            safe_node_id = re.sub(r'[^\w\-_.]', '_', frame['node_id'])
-            filename = os.path.join(session_folder, f"{safe_node_id}.png")
-            
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            
-            image_paths[frame["node_id"]] = filename
-            logger.debug(f"Downloaded image for frame '{frame['name']}' to {filename}")
-            
-        except Exception as e:
-            logger.error(f"Error downloading image for frame '{frame['name']}': {str(e)}")
-    
-    return image_paths, session_folder
-
 # API endpoint to process Figma URL
 @app.route("/process-figma", methods=["POST"])
 def process_figma():
@@ -148,23 +117,24 @@ def process_figma():
         frames, frame_ids = extract_frames(file_data)
         image_urls = fetch_figma_frame_images(file_key, frame_ids)
         
+        # Prepare frames with image URLs
+        total_frames = 0
+        processed_frames = []
         for frame in frames:
-            frame['image_url'] = image_urls.get(frame['node_id'], '')
-        
-        total_frames = len([frame for frame in frames if frame.get('image_url')])
-        image_paths, session_folder = download_images(frames, session_id)
+            image_url = image_urls.get(frame['node_id'], '')
+            if image_url:
+                frame['image_url'] = image_url
+                processed_frames.append({
+                    'name': frame['name'],
+                    'node_id': frame['node_id'],
+                    'image_url': image_url
+                })
+                total_frames += 1
         
         result = {
             'total_frames': total_frames,
-            'images': [
-                {
-                    'name': frame['name'],
-                    'node_id': frame['node_id'],
-                    'path': image_paths.get(frame['node_id'], '')
-                }
-                for frame in frames if frame['node_id'] in image_paths
-            ],
-            'session_folder': session_folder
+            'images': processed_frames,
+            'session_id': session_id
         }
         
         return jsonify({"status": "success", "result": result})
@@ -172,15 +142,6 @@ def process_figma():
     except Exception as e:
         logger.error(f"Error processing Figma URL: {str(e)}")
         abort(500, description=str(e))
-
-# Endpoint to serve images
-@app.route("/images/<session_id>/<node_id>", methods=["GET"])
-def get_image(session_id, node_id):
-    safe_node_id = re.sub(r'[^\w\-_.]', '_', node_id)
-    image_path = os.path.join(UPLOAD_FOLDER, "frames", session_id, f"{safe_node_id}.png")
-    if not os.path.exists(image_path):
-        abort(404, description="Image not found")
-    return send_file(image_path, mimetype="image/png")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
